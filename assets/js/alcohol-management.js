@@ -995,13 +995,68 @@ function matchesSearchQuery(haystack, query) {
   );
 }
 
-function catalogueSearch(query, limit = 18) {
+function manualProductSuggestions() {
+  return state.items
+    .filter((item) => normalizeEntrySource(item.entrySource) === "manual")
+    .map((item) => ({
+      id: item.id,
+      inventoryItemId: item.id,
+      catalogId: "",
+      entrySource: "manual",
+      name: item.name,
+      category: item.category || "Other",
+      size: item.size || "",
+      brand: item.brand || "",
+      subcategory: "",
+      style: "",
+      country: "",
+      unitsPerCase: integer(item.unitsPerCase),
+      caseCost: nonNegative(item.caseCost),
+      caseMarkup: nonNegative(item.caseMarkup),
+      caseSellingPrice: nonNegative(item.caseSellingPrice),
+      unitCost: nonNegative(item.unitCost),
+      unitMarkup: nonNegative(item.unitMarkup),
+      sellingPrice: nonNegative(item.sellingPrice),
+      supplier: item.supplier || "",
+      reorderLevel: integer(item.reorderLevel),
+      notes: item.notes || ""
+    }));
+}
+
+function searchableProductSuggestions(includeManual = false) {
+  const catalogue = state.catalog.map((item) => ({
+    ...item,
+    catalogId: item.id,
+    inventoryItemId: "",
+    entrySource: "catalog"
+  }));
+
+  if (!includeManual) return catalogue;
+
+  const combined = [];
+  const seen = new Set();
+
+  // Put manually saved products first. When the same name and size are also in
+  // the master list, the saved manual record is the more useful choice because
+  // it carries the user's units-per-case, pricing, supplier and other details.
+  [...manualProductSuggestions(), ...catalogue].forEach((item) => {
+    const key = `${normalizeSearchText(item.name)}|${normalizeSearchText(item.size)}`;
+    if (!item.name || seen.has(key)) return;
+    seen.add(key);
+    combined.push(item);
+  });
+
+  return combined;
+}
+
+function catalogueSearch(query, limit = 18, options = {}) {
   const clean = normalizeSearchText(query);
-  if (!clean || !state.catalog.length) return [];
+  const products = searchableProductSuggestions(options.includeManual === true);
+  if (!clean || !products.length) return [];
 
   const matches = [];
 
-  for (const item of state.catalog) {
+  for (const item of products) {
     const searchable = [
       item.name,
       item.brand,
@@ -1009,7 +1064,9 @@ function catalogueSearch(query, limit = 18) {
       item.category,
       item.subcategory,
       item.style,
-      item.country
+      item.country,
+      item.supplier,
+      entrySourceLabel(item.entrySource)
     ].join(" ");
 
     if (!matchesSearchQuery(searchable, clean)) continue;
@@ -1029,6 +1086,8 @@ function catalogueSearch(query, limit = 18) {
 
   matches.sort((a, b) =>
     a.score - b.score ||
+    (normalizeEntrySource(a.item.entrySource) === "manual" ? -1 : 0) -
+      (normalizeEntrySource(b.item.entrySource) === "manual" ? -1 : 0) ||
     a.item.name.localeCompare(b.item.name) ||
     a.item.size.localeCompare(b.item.size)
   );
@@ -2690,6 +2749,9 @@ function openItemModal(item = null, prefill = null, targetCountSetId = null, pro
   ])].filter(Boolean).sort();
 
   const currentCalc = calculate(current);
+  const manualChoiceCount = state.items.filter(
+    (savedItem) => normalizeEntrySource(savedItem.entrySource) === "manual"
+  ).length;
 
   const targetCountSet = targetCountSetId
     ? state.countSets.find((s) => s.id === targetCountSetId)
@@ -2731,9 +2793,13 @@ function openItemModal(item = null, prefill = null, targetCountSetId = null, pro
             <span id="catalogueHelp" class="help-text">
               ${productEntryMode === "manual"
                 ? "This product will be saved with a MANUAL label and synchronized to Firebase."
-                : state.catalog.length
-                  ? `${formatNumber(state.catalog.length)} master-list choices available. Use ↑ ↓ and Enter.`
-                  : "Loading the master alcohol list…"}
+                : productEntryMode === "catalog"
+                  ? state.catalog.length
+                    ? `${formatNumber(state.catalog.length)} master-list choices available. Use ↑ ↓ and Enter.`
+                    : "Loading the master alcohol list…"
+                  : state.catalog.length || manualChoiceCount
+                    ? `${formatNumber(state.catalog.length)} master-list choices${manualChoiceCount ? ` + ${formatNumber(manualChoiceCount)} manually saved product${manualChoiceCount === 1 ? "" : "s"}` : ""}. Use ↑ ↓ and Enter.`
+                    : "Loading saved products and the master alcohol list…"}
             </span>
           </div>
 
@@ -2962,6 +3028,7 @@ function openItemModal(item = null, prefill = null, targetCountSetId = null, pro
 
   let suggestions = [];
   let activeSuggestion = -1;
+  let selectedInventoryItemId = "";
 
   const suggestionMenu = $("productSuggestions");
   const productInput = $("itemName");
@@ -2974,13 +3041,47 @@ function openItemModal(item = null, prefill = null, targetCountSetId = null, pro
     productInput.setAttribute("aria-expanded", "false");
   };
 
-  const chooseSuggestion = (catalogueItem) => {
-    if (!catalogueItem) return;
-    $("itemCatalogId").value = catalogueItem.id;
-    productInput.value = catalogueItem.name;
-    $("itemCategory").value = catalogueItem.category;
-    $("itemSize").value = catalogueItem.size;
+  const chooseSuggestion = (suggestedItem) => {
+    if (!suggestedItem) return;
+
+    const suggestionSource = normalizeEntrySource(suggestedItem.entrySource || "catalog");
+    selectedInventoryItemId = suggestionSource === "manual"
+      ? String(suggestedItem.inventoryItemId || suggestedItem.id || "")
+      : "";
+
+    $("itemCatalogId").value = suggestionSource === "catalog"
+      ? String(suggestedItem.catalogId || suggestedItem.id || "")
+      : "";
+
+    productInput.value = suggestedItem.name;
+    $("itemCategory").value = suggestedItem.category || "Other";
+    $("itemSize").value = suggestedItem.size || "";
+
+    if (suggestionSource === "manual") {
+      const savedValues = {
+        itemUnitsPerCase: suggestedItem.unitsPerCase,
+        itemCaseCost: suggestedItem.caseCost,
+        itemCaseMarkup: suggestedItem.caseMarkup,
+        itemCaseSelling: suggestedItem.caseSellingPrice,
+        itemUnitCost: suggestedItem.unitCost,
+        itemUnitMarkup: suggestedItem.unitMarkup,
+        itemSellingPrice: suggestedItem.sellingPrice,
+        itemSupplier: suggestedItem.supplier,
+        itemReorder: suggestedItem.reorderLevel,
+        itemNotes: suggestedItem.notes
+      };
+
+      Object.entries(savedValues).forEach(([fieldId, value]) => {
+        const field = $(fieldId);
+        if (!field) return;
+        if (typeof value === "number" && value <= 0) return;
+        if (value === null || value === undefined || String(value).trim() === "") return;
+        field.value = value;
+      });
+    }
+
     hideSuggestions();
+    preview();
     $("itemCases").focus();
   };
 
@@ -2991,7 +3092,9 @@ function openItemModal(item = null, prefill = null, targetCountSetId = null, pro
     }
 
     const query = productInput.value;
-    suggestions = catalogueSearch(query);
+    suggestions = catalogueSearch(query, 18, {
+      includeManual: productEntryMode === "combined"
+    });
 
     if (!query.trim()) {
       hideSuggestions();
@@ -3001,7 +3104,9 @@ function openItemModal(item = null, prefill = null, targetCountSetId = null, pro
     if (!suggestions.length) {
       suggestionMenu.innerHTML = `
         <div class="autocomplete-empty">
-          No master-list match. You may continue with the name you typed.
+          ${productEntryMode === "catalog"
+            ? "No master-list match."
+            : "No saved or master-list product matches. You may continue with the name you typed."}
         </div>`;
       suggestionMenu.classList.remove("hidden");
       productInput.setAttribute("aria-expanded", "true");
@@ -3012,7 +3117,7 @@ function openItemModal(item = null, prefill = null, targetCountSetId = null, pro
       activeSuggestion = 0;
     }
 
-    suggestionMenu.innerHTML = suggestions.map((catalogueItem, index) => `
+    suggestionMenu.innerHTML = suggestions.map((suggestedItem, index) => `
       <button
         class="autocomplete-option ${index === activeSuggestion ? "active" : ""}"
         type="button"
@@ -3020,11 +3125,12 @@ function openItemModal(item = null, prefill = null, targetCountSetId = null, pro
         aria-selected="${index === activeSuggestion}"
         data-index="${index}"
       >
-        <span class="autocomplete-name">${escapeHtml(catalogueItem.name)}</span>
+        <span class="autocomplete-name">${escapeHtml(suggestedItem.name)}</span>
         <span class="autocomplete-meta">
-          ${escapeHtml(catalogueItem.size || "Size not listed")}
-          · ${escapeHtml(catalogueItem.category)}
-          ${catalogueItem.brand ? ` · ${escapeHtml(catalogueItem.brand)}` : ""}
+          ${entrySourceBadge(suggestedItem.entrySource || "catalog")}
+          ${escapeHtml(suggestedItem.size || "Size not listed")}
+          · ${escapeHtml(suggestedItem.category)}
+          ${suggestedItem.brand ? ` · ${escapeHtml(suggestedItem.brand)}` : ""}
         </span>
       </button>
     `).join("");
@@ -3042,6 +3148,7 @@ function openItemModal(item = null, prefill = null, targetCountSetId = null, pro
 
   productInput.addEventListener("input", () => {
     $("itemCatalogId").value = "";
+    selectedInventoryItemId = "";
     activeSuggestion = 0;
     if (productEntryMode !== "manual") renderSuggestions();
   });
@@ -3421,7 +3528,11 @@ function openItemModal(item = null, prefill = null, targetCountSetId = null, pro
       const normalizedName = normalizeSearchText(name);
       const normalizedSize = normalizeSearchText(size);
 
-      const existingItem = state.items.find((item) => {
+      const selectedSavedItem = selectedInventoryItemId
+        ? state.items.find((savedItem) => savedItem.id === selectedInventoryItemId)
+        : null;
+
+      const existingItem = selectedSavedItem || state.items.find((item) => {
         if (catalogId && item.catalogId && item.catalogId === catalogId) return true;
 
         return (
@@ -3431,7 +3542,7 @@ function openItemModal(item = null, prefill = null, targetCountSetId = null, pro
       }) || null;
 
       const itemId = existingItem?.id || uid();
-      const requestedSource = productEntryMode === "manual"
+      const requestedSource = productEntryMode === "manual" || selectedInventoryItemId
         ? "manual"
         : catalogId
           ? "catalog"

@@ -376,7 +376,8 @@ tbody tr.not-in-set:hover td,tbody tr.not-in-set:hover td.sticky-name{background
   box-shadow:inset 3px 0 0 var(--gold)
 }
 .autocomplete-name{font-weight:850;color:var(--navy-900)}
-.autocomplete-meta{color:var(--muted);font-size:10px}
+.autocomplete-meta{display:flex;align-items:center;gap:6px;flex-wrap:wrap;color:var(--muted);font-size:10px}
+.autocomplete-meta .source-badge{padding:2px 5px;font-size:7px}
 .autocomplete-empty{padding:14px;color:var(--muted);text-align:center;font-size:11px}
 
 /* Separate case and unit pricing */
