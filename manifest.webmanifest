@@ -1,0 +1,15 @@
+{
+  "name": "Price King Distributors Inventory Portal",
+  "short_name": "PKD Inventory",
+  "start_url": "index.html",
+  "display": "standalone",
+  "background_color": "#eef2f7",
+  "theme_color": "#081a36",
+  "icons": [
+    {
+      "src": "assets/icons/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}
