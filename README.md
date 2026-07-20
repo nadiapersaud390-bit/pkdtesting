@@ -14,3 +14,5 @@ Firebase-connected alcohol inventory and stock-count application.
 - `manifest.webmanifest` — web-app manifest.
 
 Obsolete development snapshots and duplicate versioned files have been removed.
+
+When the same product and bottle size are added to a count set again, the application increases the existing row quantity instead of creating another duplicate row. Existing duplicate rows for that product are consolidated during the update.

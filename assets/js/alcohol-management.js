@@ -2329,6 +2329,188 @@ function openInventorySettingsModal() {
   });
 }
 
+
+function countSetLineMatchesProduct(line, product) {
+  const lineItemId = String(line?.itemId || "").trim();
+  const productItemId = String(product?.itemId || product?.id || "").trim();
+
+  if (lineItemId && productItemId && lineItemId === productItemId) return true;
+
+  const lineCatalogId = String(line?.catalogId || "").trim();
+  const productCatalogId = String(product?.catalogId || "").trim();
+
+  if (lineCatalogId && productCatalogId && lineCatalogId === productCatalogId) return true;
+
+  return (
+    normalizeSearchText(line?.name) === normalizeSearchText(product?.name) &&
+    normalizeSearchText(line?.size) === normalizeSearchText(product?.size)
+  );
+}
+
+function countSetLineQuantity(line) {
+  const recordedTotal = integer(line?.totalUnitsAdded);
+  if (recordedTotal > 0) return recordedTotal;
+
+  return (
+    integer(line?.casesAdded) * integer(line?.unitsPerCase) +
+    integer(line?.looseUnitsAdded)
+  );
+}
+
+function firstPositiveLineValue(incomingValue, existingLines, field) {
+  const incoming = nonNegative(incomingValue);
+  if (incoming > 0) return incoming;
+
+  for (const line of existingLines) {
+    const value = nonNegative(line?.[field]);
+    if (value > 0) return value;
+  }
+
+  return 0;
+}
+
+function mergeCountSetProductLines(existingLines, incomingLine, lineId) {
+  const firstExisting = existingLines[0] || {};
+  const existingQuantity = existingLines.reduce(
+    (sum, line) => sum + countSetLineQuantity(line),
+    0
+  );
+  const totalUnitsAdded = existingQuantity + countSetLineQuantity(incomingLine);
+
+  const unitsPerCase =
+    integer(incomingLine.unitsPerCase) ||
+    existingLines.map((line) => integer(line.unitsPerCase)).find((value) => value > 0) ||
+    0;
+
+  const casesAdded = unitsPerCase > 0
+    ? Math.floor(totalUnitsAdded / unitsPerCase)
+    : 0;
+  const looseUnitsAdded = unitsPerCase > 0
+    ? totalUnitsAdded % unitsPerCase
+    : totalUnitsAdded;
+
+  const existingSource = existingLines
+    .map((line) => normalizeEntrySource(line.entrySource))
+    .find((source) => source !== "legacy");
+
+  const existingAddedTimes = existingLines
+    .map((line) => number(line.addedAt))
+    .filter((value) => value > 0);
+
+  return {
+    id: lineId,
+    itemId: String(incomingLine.itemId || firstExisting.itemId || ""),
+    catalogId: String(incomingLine.catalogId || firstExisting.catalogId || ""),
+    entrySource: existingSource || normalizeEntrySource(incomingLine.entrySource),
+    name: String(incomingLine.name || firstExisting.name || "").trim(),
+    category: String(incomingLine.category || firstExisting.category || "Other").trim(),
+    size: String(incomingLine.size || firstExisting.size || "").trim(),
+    casesAdded,
+    unitsPerCase,
+    looseUnitsAdded,
+    totalUnitsAdded,
+    caseCost: firstPositiveLineValue(incomingLine.caseCost, existingLines, "caseCost"),
+    caseSellingPrice: firstPositiveLineValue(incomingLine.caseSellingPrice, existingLines, "caseSellingPrice"),
+    unitCost: firstPositiveLineValue(incomingLine.unitCost, existingLines, "unitCost"),
+    unitSellingPrice: firstPositiveLineValue(incomingLine.unitSellingPrice, existingLines, "unitSellingPrice"),
+    stockCost:
+      existingLines.reduce((sum, line) => sum + nonNegative(line.stockCost), 0) +
+      nonNegative(incomingLine.stockCost),
+    salesValue:
+      existingLines.reduce((sum, line) => sum + nonNegative(line.salesValue), 0) +
+      nonNegative(incomingLine.salesValue),
+    potentialProfit:
+      existingLines.reduce((sum, line) => sum + number(line.potentialProfit), 0) +
+      number(incomingLine.potentialProfit),
+    supplier: String(incomingLine.supplier || firstExisting.supplier || "").trim(),
+    notes: String(incomingLine.notes || firstExisting.notes || "").trim(),
+    addedAt: existingAddedTimes.length ? Math.min(...existingAddedTimes) : serverTimestamp(),
+    addedBy: String(firstExisting.addedBy || incomingLine.addedBy || ""),
+    addedByName: String(firstExisting.addedByName || incomingLine.addedByName || ""),
+    lastAddedAt: serverTimestamp(),
+    lastAddedBy: String(incomingLine.addedBy || ""),
+    lastAddedByName: String(incomingLine.addedByName || ""),
+    mergeCount:
+      existingLines.reduce((sum, line) => sum + Math.max(1, integer(line.mergeCount)), 0) + 1,
+    updatedAt: serverTimestamp()
+  };
+}
+
+function summarizeCountSetLines(lines) {
+  return lines.reduce((summary, line) => {
+    summary.lineCount += 1;
+    summary.productCount += 1;
+    summary.totalCases += integer(line.casesAdded);
+    summary.totalUnits += countSetLineQuantity(line);
+    summary.stockCost += nonNegative(line.stockCost);
+    summary.salesValue += nonNegative(line.salesValue);
+    summary.potentialProfit += number(line.potentialProfit);
+    return summary;
+  }, {
+    lineCount: 0,
+    productCount: 0,
+    totalCases: 0,
+    totalUnits: 0,
+    stockCost: 0,
+    salesValue: 0,
+    potentialProfit: 0
+  });
+}
+
+async function prepareCountSetLineMerge(countSetId, incomingLine) {
+  const countSetRef = ref(database, `${PATHS.countSets}/${countSetId}`);
+  const snapshot = await get(countSetRef);
+
+  if (!snapshot.exists()) {
+    throw new Error("The selected count set could not be found.");
+  }
+
+  const latestCountSet = sanitizeCountSet(snapshot.val(), countSetId);
+
+  if (latestCountSet.status !== "open") {
+    throw new Error("The selected count set is not open.");
+  }
+
+  const matchingLines = latestCountSet.items.filter((line) =>
+    countSetLineMatchesProduct(line, incomingLine)
+  );
+
+  const lineId = matchingLines[0]?.lineId ||
+    push(ref(database, `${PATHS.countSets}/${countSetId}/items`)).key ||
+    uid();
+
+  const mergedLine = mergeCountSetProductLines(matchingLines, incomingLine, lineId);
+  const remainingLines = latestCountSet.items.filter((line) =>
+    !matchingLines.some((match) => match.lineId === line.lineId)
+  );
+  const finalLines = [...remainingLines, mergedLine];
+  const summary = summarizeCountSetLines(finalLines);
+
+  const updates = {};
+  updates[`${PATHS.countSets}/${countSetId}/items/${lineId}`] = mergedLine;
+
+  matchingLines.slice(1).forEach((duplicateLine) => {
+    updates[`${PATHS.countSets}/${countSetId}/items/${duplicateLine.lineId}`] = null;
+  });
+
+  updates[`${PATHS.countSets}/${countSetId}/lineCount`] = summary.lineCount;
+  updates[`${PATHS.countSets}/${countSetId}/productCount`] = summary.productCount;
+  updates[`${PATHS.countSets}/${countSetId}/totalCases`] = summary.totalCases;
+  updates[`${PATHS.countSets}/${countSetId}/totalUnits`] = summary.totalUnits;
+  updates[`${PATHS.countSets}/${countSetId}/stockCost`] = summary.stockCost;
+  updates[`${PATHS.countSets}/${countSetId}/salesValue`] = summary.salesValue;
+  updates[`${PATHS.countSets}/${countSetId}/potentialProfit`] = summary.potentialProfit;
+  updates[`${PATHS.countSets}/${countSetId}/updatedAt`] = serverTimestamp();
+
+  return {
+    updates,
+    merged: matchingLines.length > 0,
+    removedDuplicateLines: Math.max(0, matchingLines.length - 1),
+    lineId,
+    countSet: latestCountSet
+  };
+}
+
 function openSelectCountSetModal(inventoryItem) {
   const sorted = state.countSets.slice().sort((a, b) =>
     String(b.countDate).localeCompare(String(a.countDate))
@@ -2382,9 +2564,13 @@ function openSelectCountSetModal(inventoryItem) {
     saveBtn.disabled = true;
     saveBtn.textContent = "Saving…";
     try {
-      await quickSaveItemToCountSet(inventoryItem, countSet);
+      const result = await quickSaveItemToCountSet(inventoryItem, countSet);
       closeModal();
-      toast(`${inventoryItem.name} added to "${countSet.name}".`);
+      toast(
+        result.merged
+          ? `${inventoryItem.name} was already in "${countSet.name}". Its quantity was increased.`
+          : `${inventoryItem.name} added to "${countSet.name}".`
+      );
     } catch (err) {
       console.error(err);
       toast("Save failed. Please try again.", "error");
@@ -2397,11 +2583,7 @@ function openSelectCountSetModal(inventoryItem) {
 async function quickSaveItemToCountSet(item, countSet) {
   const calc = calculate(item);
 
-  const lineRef = push(ref(database, `${PATHS.countSets}/${countSet.id}/items`));
-  const lineId = lineRef.key;
-
   const linePayload = {
-    id: lineId,
     itemId: item.id,
     catalogId: item.catalogId || "",
     entrySource: normalizeEntrySource(item.entrySource),
@@ -2426,27 +2608,32 @@ async function quickSaveItemToCountSet(item, countSet) {
     addedByName: state.profile?.displayName || ""
   };
 
-  const updates = {};
-  updates[`${PATHS.countSets}/${countSet.id}/items/${lineId}`] = linePayload;
-  updates[`${PATHS.countSets}/${countSet.id}/lineCount`]       = (countSet.lineCount || 0) + 1;
-  updates[`${PATHS.countSets}/${countSet.id}/productCount`]    = (countSet.productCount || 0) + 1;
-  updates[`${PATHS.countSets}/${countSet.id}/totalCases`]      = (countSet.totalCases || 0) + item.cases;
-  updates[`${PATHS.countSets}/${countSet.id}/totalUnits`]      = (countSet.totalUnits || 0) + calc.quantity;
-  updates[`${PATHS.countSets}/${countSet.id}/stockCost`]       = (countSet.stockCost || 0) + calc.stockCost;
-  updates[`${PATHS.countSets}/${countSet.id}/salesValue`]      = (countSet.salesValue || 0) + calc.salesValue;
-  updates[`${PATHS.countSets}/${countSet.id}/potentialProfit`] = (countSet.potentialProfit || 0) + calc.profit;
-  updates[`${PATHS.countSets}/${countSet.id}/updatedAt`]       = serverTimestamp();
-  updates[`${PATHS.items}/${item.id}/lastCountSetId`]          = countSet.id;
-  updates[`${PATHS.items}/${item.id}/lastCountSetName`]        = countSet.name;
-  updates[`${PATHS.items}/${item.id}/updatedAt`]               = serverTimestamp();
+  const mergeResult = await prepareCountSetLineMerge(countSet.id, linePayload);
+  const updates = { ...mergeResult.updates };
+
+  updates[`${PATHS.items}/${item.id}/lastCountSetId`] = countSet.id;
+  updates[`${PATHS.items}/${item.id}/lastCountSetName`] = countSet.name;
+  updates[`${PATHS.items}/${item.id}/updatedAt`] = serverTimestamp();
 
   await update(ref(database), updates);
 
   await addAudit(
-    "item_added_to_count_set",
-    `Recorded ${calc.quantity} unit${calc.quantity === 1 ? "" : "s"} of ${item.name} in "${countSet.name}"`,
-    { countSetId: countSet.id, countSetName: countSet.name, itemId: item.id, itemName: item.name, unitsAdded: calc.quantity }
+    mergeResult.merged ? "item_quantity_increased_in_count_set" : "item_added_to_count_set",
+    mergeResult.merged
+      ? `Increased ${item.name} by ${calc.quantity} unit${calc.quantity === 1 ? "" : "s"} in "${countSet.name}"`
+      : `Recorded ${calc.quantity} unit${calc.quantity === 1 ? "" : "s"} of ${item.name} in "${countSet.name}"`,
+    {
+      countSetId: countSet.id,
+      countSetName: countSet.name,
+      itemId: item.id,
+      itemName: item.name,
+      unitsAdded: calc.quantity,
+      mergedIntoExistingLine: mergeResult.merged,
+      removedDuplicateLines: mergeResult.removedDuplicateLines
+    }
   );
+
+  return mergeResult;
 }
 
 function openItemModal(item = null, prefill = null, targetCountSetId = null, productEntryMode = "combined") {
@@ -3298,11 +3485,7 @@ function openItemModal(item = null, prefill = null, targetCountSetId = null, pro
         lastCountSetName: countSet.name
       };
 
-      const lineRef = push(ref(database, `${PATHS.countSets}/${countSet.id}/items`));
-      const lineId = lineRef.key;
-
       const linePayload = {
-        id: lineId,
         itemId,
         catalogId,
         entrySource,
@@ -3327,39 +3510,37 @@ function openItemModal(item = null, prefill = null, targetCountSetId = null, pro
         addedByName: state.profile?.displayName || ""
       };
 
-      const updates = {};
+      const countSetMerge = await prepareCountSetLineMerge(countSet.id, linePayload);
+      const updates = { ...countSetMerge.updates };
       updates[`${PATHS.items}/${itemId}`] = aggregatePayload;
-      updates[`${PATHS.countSets}/${countSet.id}/items/${lineId}`] = linePayload;
-      updates[`${PATHS.countSets}/${countSet.id}/lineCount`] = countSet.lineCount + 1;
-      updates[`${PATHS.countSets}/${countSet.id}/productCount`] = countSet.productCount + 1;
-      updates[`${PATHS.countSets}/${countSet.id}/totalCases`] = countSet.totalCases + values.cases;
-      updates[`${PATHS.countSets}/${countSet.id}/totalUnits`] = countSet.totalUnits + incomingCalc.quantity;
-      updates[`${PATHS.countSets}/${countSet.id}/stockCost`] = countSet.stockCost + incomingCalc.stockCost;
-      updates[`${PATHS.countSets}/${countSet.id}/salesValue`] = countSet.salesValue + incomingCalc.salesValue;
-      updates[`${PATHS.countSets}/${countSet.id}/potentialProfit`] = countSet.potentialProfit + incomingCalc.profit;
-      updates[`${PATHS.countSets}/${countSet.id}/updatedAt`] = serverTimestamp();
 
       await update(ref(database), updates);
 
       await addAudit(
-        "item_added_to_count_set",
-        `Added ${incomingCalc.quantity} unit${incomingCalc.quantity === 1 ? "" : "s"} of ${name} to "${countSet.name}"`,
+        countSetMerge.merged ? "item_quantity_increased_in_count_set" : "item_added_to_count_set",
+        countSetMerge.merged
+          ? `Increased ${name} by ${incomingCalc.quantity} unit${incomingCalc.quantity === 1 ? "" : "s"} in "${countSet.name}"`
+          : `Added ${incomingCalc.quantity} unit${incomingCalc.quantity === 1 ? "" : "s"} of ${name} to "${countSet.name}"`,
         {
           countSetId: countSet.id,
           countSetName: countSet.name,
           itemId,
           itemName: name,
           unitsAdded: incomingCalc.quantity,
-          entrySource
+          entrySource,
+          mergedIntoExistingLine: countSetMerge.merged,
+          removedDuplicateLines: countSetMerge.removedDuplicateLines
         }
       );
 
       closeModal();
 
       toast(
-        existingItem
-          ? `${formatNumber(incomingCalc.quantity)} units added to the existing ${name} stock.`
-          : `${name} added to ${countSet.name}${entrySource === "manual" ? " and marked MANUAL" : ""}.`
+        countSetMerge.merged
+          ? `${name} was already in ${countSet.name}. The existing row was increased by ${formatNumber(incomingCalc.quantity)} units.`
+          : existingItem
+            ? `${formatNumber(incomingCalc.quantity)} units added to the existing ${name} stock and recorded in ${countSet.name}.`
+            : `${name} added to ${countSet.name}${entrySource === "manual" ? " and marked MANUAL" : ""}.`
       );
     } catch (error) {
       console.error(error);
